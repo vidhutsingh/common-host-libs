@@ -16,7 +16,7 @@ const (
 	volumeSize   = 1024 * 1024 * 1024
 	snapshotName = "testCspSnapshot"
 	cloneName    = "testCspVolClone"
-	cloneSize    = 2 * 1024 * 1024 * 1024
+	cloneSize    = volumeSize
 )
 
 var (
@@ -53,6 +53,10 @@ func _TestPluginSuite(t *testing.T) {
 		t.Fatal("Failed to create volume " + volumeName)
 	}
 
+	// Clear the provider auth-token (empty).
+	// This is to test if login attempt is made when cached authToken is empty.
+	provider.AuthToken = ""
+
 	volume, err = provider.GetVolume(volume.ID)
 	if err != nil {
 		t.Fatal("Error retrieving volume")
@@ -84,8 +88,7 @@ func _TestPluginSuite(t *testing.T) {
 	// Delete the clone
 	deleteVolume(t, provider, clone)
 
-	// Delete the snapshot
-	deleteSnapshot(t, provider, snapshot)
+	// Base snapshot gets deleted when clone is deleted
 
 	// Create a new snapshot manually
 	snapshot, err = provider.CreateSnapshot(snapshotName, snapshotName, volume.ID, nil)
@@ -118,7 +121,7 @@ func realCsp(t *testing.T) *ContainerStorageProvider {
 		},
 	)
 	if err != nil {
-		t.Fatal("Error building CSP")
+		t.Fatalf("Error building CSP, Error: %s", err.Error())
 	}
 
 	return provider
@@ -132,7 +135,7 @@ func createClone(t *testing.T, provider *ContainerStorageProvider, sourceVolumeI
 		t.Fatal("Failed to clone volume")
 	}
 	assert.Equal(t, clone.Name, cloneName)
-	assert.Equal(t, clone.Size, cloneSize)
+	assert.Equal(t, clone.Size, int64(cloneSize))
 
 	snapshot, err := provider.GetSnapshot(clone.BaseSnapID)
 	if err != nil {
@@ -145,7 +148,7 @@ func createClone(t *testing.T, provider *ContainerStorageProvider, sourceVolumeI
 
 // nolint: dupl
 func deleteVolume(t *testing.T, provider *ContainerStorageProvider, volume *model.Volume) {
-	err := provider.DeleteVolume(volume.ID, false)
+	err := provider.DeleteVolume(volume.ID, true)
 	if err != nil {
 		t.Fatal("Could not delete volume " + volume.Name + ".  Error: " + err.Error())
 	}

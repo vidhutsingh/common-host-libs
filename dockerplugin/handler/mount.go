@@ -134,7 +134,7 @@ func VolumeDriverMount(w http.ResponseWriter, r *http.Request) {
 	log.Trace("retrieved volume response from container provider for volume: %+v", volume)
 
 	//4.  Get mounts from host
-	err = chapiClient.GetMounts(&respMount, plugin.GetDeviceSerialNumber(volume.SerialNumber))
+	err = chapiClient.GetMounts(&respMount, volume.SerialNumber)
 	if err != nil && !(strings.Contains(err.Error(), "object was not found")) {
 		mr = MountResponse{Err: err.Error()}
 		json.NewEncoder(w).Encode(mr)
@@ -239,17 +239,17 @@ func filterHostNetworks(pluginReq *PluginRequest) error {
 	index := 0
 	for _, initiator := range initiators {
 		// ignore unwanted networks based on user input
-		for _, network := range pluginReq.Host.Networks {
+		for _, network := range pluginReq.Host.NetworkInterfaces {
 			// check if initiator ip addresses or interfaces are provided to match with current node
 			if (isIPAddress(initiator) && network.AddressV4 == initiator) || network.Name == initiator {
-				pluginReq.Host.Networks[index] = network
+				pluginReq.Host.NetworkInterfaces[index] = network
 				log.Debugf("matched filtered network %s, ip %s", network.Name, network.AddressV4)
 				index++
 			}
 		}
 	}
 	// trim unwanted network interfaces
-	pluginReq.Host.Networks = pluginReq.Host.Networks[:index]
+	pluginReq.Host.NetworkInterfaces = pluginReq.Host.NetworkInterfaces[:index]
 
 	return nil
 }
@@ -465,7 +465,7 @@ func cleanupStaleMounts(containerProviderClient *connectivity.Client, chapiClien
 	}
 	log.Tracef("volumeInfo is %+v", volumeInfo)
 	// get the mounts of the volumes's serial number
-	_ = chapiClient.GetMounts(&respMount, plugin.GetDeviceSerialNumber(volumeInfo.SerialNumber))
+	_ = chapiClient.GetMounts(&respMount, volumeInfo.SerialNumber)
 	if respMount == nil || len(respMount) == 0 {
 		log.Tracef("no existing stale mounts found for volume %s, continue with mount", volumeInfo.Name)
 		return
@@ -601,13 +601,13 @@ func isCurrentHostAttachedIscsi(volume *model.Volume, pluginReq *PluginRequest) 
 
 	for _, iscsiSession := range volume.IscsiSessions {
 		for _, iscsiInit := range iscsiInits {
-			if strings.TrimSpace(initiatorName(iscsiSession)) == strings.TrimSpace(iscsiInit) {
+			if strings.TrimSpace(iscsiSession.InitiatorNameStr()) == strings.TrimSpace(iscsiInit) {
 				log.Debugf("host iscsi initiator %s matched volume iscsi session", iscsiInit)
 				return true
 			}
 		}
-		if initiatorIP(iscsiSession) != "" {
-			for _, network := range pluginReq.Host.Networks {
+		if iscsiSession.InitiatorIP != "" {
+			for _, network := range pluginReq.Host.NetworkInterfaces {
 				if strings.TrimSpace(iscsiSession.InitiatorIP) == strings.TrimSpace(network.AddressV4) {
 					log.Debugf("host iscsi initiator %s matched volume iscsi connection", network.AddressV4)
 					return true
@@ -638,7 +638,7 @@ func isCurrentHostAttachedFC(volume *model.Volume, pluginReq *PluginRequest) boo
 
 	for _, fcSession := range volume.FcSessions {
 		for _, fcInit := range fcInits {
-			if strings.TrimSpace(strings.Replace(initiatorWwpn(fcSession), ":", "", -1)) == strings.TrimSpace(fcInit) {
+			if strings.TrimSpace(strings.Replace(fcSession.InitiatorWwpnStr(), ":", "", -1)) == strings.TrimSpace(fcInit) {
 				log.Infof("host initiator %s matched volume FC sessions %s", fcInit, fcSession)
 				return true
 			}

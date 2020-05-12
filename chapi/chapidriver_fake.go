@@ -35,7 +35,7 @@ func (driver *FakeDriver) GetHostInitiators() ([]*model.Initiator, error) {
 }
 
 // GetHostNetworks reports the networks on this host
-func (driver *FakeDriver) GetHostNetworks() ([]*model.Network, error) {
+func (driver *FakeDriver) GetHostNetworks() ([]*model.NetworkInterface, error) {
 	return nil, nil
 }
 
@@ -45,6 +45,15 @@ func (driver *FakeDriver) GetHostNameAndDomain() ([]string, error) {
 		"host1",
 		"host1.domain.com",
 	}, nil
+}
+
+// GetDevice will return device matching given volume serial
+func (driver *FakeDriver) GetDevice(volume *model.Volume) (*model.Device, error) {
+	device := &model.Device{
+		SerialNumber:    volume.SerialNumber,
+		AltFullPathName: "/dev/mapper/fakeMpath",
+	}
+	return device, nil
 }
 
 // CreateDevices will create devices on this host based on the volume details provided
@@ -96,6 +105,11 @@ func (driver *FakeDriver) BindMount(mountPoint string, newMountPoint string, rbi
 	return nil
 }
 
+// BindUnmount unmounts the given bind mount
+func (driver *FakeDriver) BindUnmount(mountPoint string) error {
+	return nil
+}
+
 // GetMounts reports all mounts on this host
 func (driver *FakeDriver) GetMounts(serialNumber string) ([]*model.Mount, error) {
 	device := &model.Device{
@@ -138,5 +152,10 @@ func (driver *FakeDriver) OfflineDevice(device *model.Device) error {
 
 // ExpandDevice will expand the given device/filesystem on the host
 func (driver *FakeDriver) ExpandDevice(targetPath string, volAccessType model.VolumeAccessType) error {
+	return nil
+}
+
+// MountNFSVolume mounts NFS share onto given target path
+func (driver *FakeDriver) MountNFSVolume(source string, targetPath string, mountOptions []string) error {
 	return nil
 }

@@ -10,11 +10,12 @@ import (
 )
 
 const (
-	volumeName   = "testCspVol"
-	volumeSize   = 1024 * 1024 * 1024
-	snapshotName = "testCspSnapshot"
-	cloneName    = "testCspVolClone"
-	cloneSize    = 2 * 1024 * 1024 * 1024
+	volumeName      = "testCspVol"
+	volumeSize      = 1024 * 1024 * 1024
+	snapshotName    = "testCspSnapshot"
+	cloneName       = "testCspVolClone"
+	cloneSize       = 2 * 1024 * 1024 * 1024
+	volumeGroupName = "testCspVolumeGroup"
 )
 
 // nolint: gocyclo
@@ -55,6 +56,14 @@ func TestPluginSuite(t *testing.T) {
 	}
 	assert.True(t, updatedVolume.Size == volume.Size*2)
 
+	editConfig := make(map[string]interface{})
+	editConfig["editme"] = "edited"
+	editedVolume, err := provider.EditVolume(volume.ID, editConfig)
+	if err != nil {
+		t.Fatal("Failed to edit volume")
+	}
+	assert.True(t, editedVolume.Config["editme"] == "edited")
+
 	// CloneVolume without a source snapshot ID will indirectly test snapshot creation
 	clone := createClone(t, provider, volume.ID, "", cloneSize)
 
@@ -92,6 +101,17 @@ func TestPluginSuite(t *testing.T) {
 
 	// Delete the parent
 	deleteVolume(t, provider, volume)
+
+	// Create Volume Group
+	config["test"] = "test"
+
+	volumeGroup, err := provider.CreateVolumeGroup(volumeGroupName, volumeGroupName, config)
+	if err != nil {
+		t.Fatal("Failed to create volume group" + volumeGroupName)
+	}
+	// Delete the Volume Group
+	deleteVolumeGroup(t, provider, volumeGroup)
+
 }
 
 func fakeCsp() *StorageProvider {
@@ -129,6 +149,14 @@ func deleteVolume(t *testing.T, provider *StorageProvider, volume *model.Volume)
 		t.Fatal("Error retrieving volume. Error: " + err.Error())
 	}
 	assert.Nil(t, volume)
+}
+
+// nolint: dupl
+func deleteVolumeGroup(t *testing.T, provider *StorageProvider, volumeGroup *model.VolumeGroup) {
+	err := provider.DeleteVolumeGroup(volumeGroup.ID)
+	if err != nil {
+		t.Fatal("Could not delete volume group" + volumeGroup.Name + ".  Error: " + err.Error())
+	}
 }
 
 // nolint: dupl

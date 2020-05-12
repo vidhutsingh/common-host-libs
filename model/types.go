@@ -2,6 +2,8 @@ package model
 
 import (
 	"fmt"
+	"regexp"
+	"strings"
 )
 
 const (
@@ -86,13 +88,13 @@ func (e VolumeAccessType) String() string {
 
 // Host : provide host information
 type Host struct {
-	UUID           string       `json:"id,omitempty"`
-	Name           string       `json:"name,omitempty"`
-	Domain         string       `json:"domain,omitempty"`
-	NodeID         string       `json:"node_id,omitempty"`
-	AccessProtocol string       `json:"access_protocol,omitempty"`
-	Networks       []*Network   `json:"networks,omitempty"`
-	Initiators     []*Initiator `json:"initiators,omitempty"`
+	UUID              string              `json:"id,omitempty"`
+	Name              string              `json:"name,omitempty"`
+	Domain            string              `json:"domain,omitempty"`
+	NodeID            string              `json:"node_id,omitempty"`
+	AccessProtocol    string              `json:"access_protocol,omitempty"`
+	NetworkInterfaces []*NetworkInterface `json:"networks,omitempty"`
+	Initiators        []*Initiator        `json:"initiators,omitempty"`
 }
 
 //Mount struct ID data type is string
@@ -103,8 +105,8 @@ type Mount struct {
 	Device     *Device  `json:"device,omitempty"`
 }
 
-//Network : network interface info for host
-type Network struct {
+//NetworkInterface : network interface info for host
+type NetworkInterface struct {
 	Name        string `json:"name,omitempty"`
 	AddressV4   string `json:"address_v4,omitempty"`
 	MaskV4      string `json:"mask_v4,omitempty"`
@@ -112,6 +114,7 @@ type Network struct {
 	Mac         string `json:",omitempty"`
 	Mtu         int64  `json:",omitempty"`
 	Up          bool
+	CidrNetwork string
 }
 
 //Initiator : Host initiator
@@ -138,10 +141,8 @@ type IscsiTarget struct {
 
 //Device struct
 type Device struct {
-	VolumeID string `json:"volume_id,omitempty"`
-	Pathname string `json:"path_name,omitempty"`
-	// TODO: SerialNumber does not prepend a "2" so the client has to do it whenever invoking operations like offline or delete.
-	// We should probably include the "2" here since that's how the device is seen
+	VolumeID        string       `json:"volume_id,omitempty"`
+	Pathname        string       `json:"path_name,omitempty"`
 	SerialNumber    string       `json:"serial_number,omitempty"`
 	Major           string       `json:"major,omitempty"`
 	Minor           string       `json:"minor,omitempty"`
@@ -178,19 +179,30 @@ type Volume struct {
 	Metadata       []*KeyValue            `json:"metadata,omitempty"`
 	SerialNumber   string                 `json:"serial_number,omitempty"`
 	AccessProtocol string                 `json:"access_protocol,omitempty"`
-	Iqn            string                 `json:"iqn,omitempty"`
-	DiscoveryIP    string                 `json:"discovery_ip,omitempty"` // this field needs to be moved out ?
+	Iqn            string                 `json:"iqn,omitempty"` // deprecated
+	Iqns           []string               `json:"iqns,omitempty"`
+	DiscoveryIP    string                 `json:"discovery_ip,omitempty"` // deprecated
+	DiscoveryIPs   []string               `json:"discovery_ips,omitempty"`
 	MountPoint     string                 `json:"Mountpoint,omitempty"`
 	Status         map[string]interface{} `json:"status,omitempty"` // interface so that we can map any number of arguments
 	Chap           *ChapInfo              `json:"chap_info,omitempty"`
-	Networks       []*Network             `json:"networks,omitempty"`
+	Networks       []*NetworkInterface    `json:"networks,omitempty"`
 	ConnectionMode string                 `json:"connection_mode,omitempty"`
 	LunID          string                 `json:"lun_id,omitempty"`
 	TargetScope    string                 `json:"target_scope,omitempty"` //GST="group", VST="volume" or empty(older array fiji etc), and no-op for FC
 	IscsiSessions  []*IscsiSession        `json:"iscsi_sessions,omitempty"`
 	FcSessions     []*FcSession           `json:"fc_sessions,omitempty"`
+	VolumeGroupId  string                 `json:"volume_group_id"`
 }
 
+func (v Volume) TargetNames() []string {
+	if v.Iqn != "" {
+		return []string{v.Iqn}
+	}
+	return v.Iqns
+}
+
+// Workaround NOS 5.0.x vs 5.1.x responses with different case
 // FcSession info
 type FcSession struct {
 	InitiatorWwpn       string `json:"initiator_wwpn,omitempty"`
@@ -202,7 +214,20 @@ type IscsiSession struct {
 	InitiatorName       string `json:"initiator_name,omitempty"`
 	InitiatorNameLegacy string `json:"initiatorName,omitempty"`
 	InitiatorIP         string `json:"initiator_ip_addr,omitempty"`
-	InitiatorIPLegacy   string `json:"initiatorIp,omitempty"`
+}
+
+func (s FcSession) InitiatorWwpnStr() string {
+	if s.InitiatorWwpnLegacy != "" {
+		return s.InitiatorWwpnLegacy
+	}
+	return s.InitiatorWwpn
+}
+
+func (s IscsiSession) InitiatorNameStr() string {
+	if s.InitiatorNameLegacy != "" {
+		return s.InitiatorNameLegacy
+	}
+	return s.InitiatorName
 }
 
 // Snapshot is a snapshot of a volume
@@ -216,6 +241,14 @@ type Snapshot struct {
 	CreationTime int64                  `json:"creation_time,omitempty"`
 	ReadyToUse   bool                   `json:"ready_to_use,omitempty"`
 	InUse        bool                   `json:"in_use,omitempty"`
+	Config       map[string]interface{} `json:"config,omitempty"`
+}
+
+type VolumeGroup struct {
+	ID           string                 `json:"id,omitempty"`
+	Name         string                 `json:"name,omitempty"`
+	Description  string                 `json:"description,omitempty"`
+	CreationTime int64                  `json:"creation_time,omitempty"`
 	Config       map[string]interface{} `json:"config,omitempty"`
 }
 
@@ -239,9 +272,9 @@ type AccessInfo struct {
 
 // BlockDeviceAccessInfo contains the common fields for accessing a block device
 type BlockDeviceAccessInfo struct {
-	AccessProtocol string `json:"access_protocol,omitempty"`
-	TargetName     string `json:"target_name,omitempty"`
-	LunID          int32  `json:"lun_id,omitempty"`
+	AccessProtocol string   `json:"access_protocol,omitempty"`
+	TargetNames    []string `json:"target_names,omitempty"`
+	LunID          int32    `json:"lun_id,omitempty"`
 	IscsiAccessInfo
 }
 
@@ -265,8 +298,8 @@ type FcHostPort struct {
 
 // Iface represents iface configuring with port binding
 type Iface struct {
-	Name    string
-	Network *Network
+	Name             string
+	NetworkInterface *NetworkInterface
 }
 
 // IscsiTargets : array of pointers to IscsiTarget
@@ -282,9 +315,23 @@ type Hosts []*Host
 
 // FilesystemOpts to store fsType, fsMode, fsOwner options
 type FilesystemOpts struct {
-	Type  string
-	Mode  string
-	Owner string
+	Type       string
+	Mode       string
+	Owner      string
+	CreateOpts string
+}
+
+// GetCreateOpts returns a clean array that can be passed to the command line
+func (f FilesystemOpts) GetCreateOpts() []string {
+	cleanCharRegex := regexp.MustCompile(`[^a-zA-Z0-9=, \-]`)
+	singleSpacesRegex := regexp.MustCompile(`\s+`)
+
+	clean := cleanCharRegex.ReplaceAllString(strings.Trim(f.CreateOpts, " "), "")
+	cleanSlice := strings.Split(singleSpacesRegex.ReplaceAllString(clean, " "), " ")
+	if len(cleanSlice) == 1 && cleanSlice[0] == "" {
+		return nil
+	}
+	return cleanSlice
 }
 
 // PathInfo :

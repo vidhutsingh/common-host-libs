@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	log "github.com/hpe-storage/common-host-libs/logger"
@@ -13,14 +14,12 @@ import (
 	"github.com/hpe-storage/common-host-libs/util"
 )
 
-const (
-	maxTries = 3
-)
-
 var (
-	showPathsFormat  = []string{"show", "paths", "format", "%w %d %t %i %o %T %c %s %m"}
-	showMapsFormat   = []string{"show", "maps", "format", "%w %d %n %s"}
-	orphanPathRegexp = regexp.MustCompile(orphanPathsPattern)
+	showPathsFormat      = []string{"show", "paths", "format", "%w %d %t %i %o %T %c %s %m"}
+	showMapsFormat       = []string{"show", "maps", "format", "%w %d %n %s"}
+	orphanPathRegexp     = regexp.MustCompile(getOrphanPathsPattern())
+	multipathMutex       sync.Mutex
+	deviceVendorPatterns = []string{"Nimble", "3PARdata"}
 )
 
 const (
@@ -28,23 +27,39 @@ const (
 	MultipathConf = "/etc/multipath.conf"
 	// MultipathBindings bindings file for multipathd
 	MultipathBindings  = "/etc/multipath/bindings"
-	orphanPathsPattern = ".*(?P<host>\\d+):(?P<channel>\\d+):(?P<target>\\d+):(?P<lun>\\d+).*Nimble.*orphan"
+	orphanPathsPattern = ".*(?P<host>\\d+):(?P<channel>\\d+):(?P<target>\\d+):(?P<lun>\\d+).*(REPLACE_VENDOR).*orphan"
+	maxTries           = 3
 )
+
+func getOrphanPathsPattern() string {
+	vendorPattern := strings.Join(deviceVendorPatterns, "|")
+	return strings.Replace(orphanPathsPattern, "REPLACE_VENDOR", vendorPattern, -1)
+}
 
 // MultipathdShowMaps output
 func MultipathdShowMaps(serialNumber string) (a []string, err error) {
-	log.Tracef("MultipathdShowMaps for %s", serialNumber)
+	log.Tracef(">>>>> MultipathdShowMaps for %s", serialNumber)
+	defer log.Trace("<<<<< MultipathdShowMaps")
+
 	return multipathdShowCmd(showMapsFormat, serialNumber)
 }
 
 // MultipathdShowPaths output from Linux
 func MultipathdShowPaths(serialNumber string) (a []string, err error) {
-	log.Tracef("MultipathdShowPaths for %s", serialNumber)
+	log.Tracef(">>>>> MultipathdShowPaths for %s", serialNumber)
+	defer log.Trace("<<<<< MultipathdShowPaths")
+
 	return multipathdShowCmd(showPathsFormat, serialNumber)
 }
 
 // MultipathdReconfigure reconfigure multipathd settings
 func MultipathdReconfigure() (out string, err error) {
+	log.Trace(">>>>> MultipathdReconfigure")
+	defer log.Trace("<<<<<< MultipathdReconfigure")
+
+	multipathMutex.Lock()
+	defer multipathMutex.Unlock()
+
 	var args []string
 	args = []string{"reconfigure"}
 	out, _, err = util.ExecCommandOutput(multipathd, args)
@@ -60,8 +75,12 @@ func isMultipathTimeoutError(msg string) bool {
 }
 
 func multipathShowCmdOrphanPaths() (output []string, err error) {
-	log.Trace(">>>>> multipathShowCmdOrphanPaths called")
+	log.Trace(">>>>> multipathShowCmdOrphanPaths")
 	defer log.Trace("<<<<<< multipathShowCmdOrphanPaths")
+
+	multipathMutex.Lock()
+	defer multipathMutex.Unlock()
+
 	out, _, err := util.ExecCommandOutput(multipathd, showPathsFormat)
 	if err != nil {
 		log.Warnf("multipathdShowCmd: error %v with args %v", err, showPathsFormat)
@@ -79,6 +98,9 @@ func multipathShowCmdOrphanPaths() (output []string, err error) {
 }
 
 func multipathdShowCmd(args []string, serialNumber string) (output []string, err error) {
+	multipathMutex.Lock()
+	defer multipathMutex.Unlock()
+
 	out, _, err := util.ExecCommandOutput(multipathd, args)
 	if err != nil {
 		log.Warnf("multipathdShowCmd: error %v with args %v", err, args)
@@ -104,6 +126,7 @@ func multipathdShowCmd(args []string, serialNumber string) (output []string, err
 func tearDownMultipathDevice(dev *model.Device) (err error) {
 	log.Tracef(">>>>> tearDownMultipathDevice called for %s", dev.SerialNumber)
 	defer log.Trace("<<<<< tearDownMultipathDevice")
+
 	lines, err := MultipathdShowMaps(dev.SerialNumber)
 	if err != nil {
 		log.Trace(err)
@@ -155,23 +178,18 @@ func checkIfDeviceCanBeDeleted(dev *model.Device) (err error) {
 		if err == nil {
 			return nil
 		}
-
 	}
 	return nil
 }
 
 // retry for maxtries for device Cleanup
 func retryCleanupDeviceAndSlaves(dev *model.Device) error {
-	log.Trace("retryCleanupDeviceAndSlaves called")
-	//check if device is mounted or has holders
-	err := checkIfDeviceCanBeDeleted(dev)
-	if err != nil {
-		return err
-	}
+	log.Trace(">>>>> retryCleanupDeviceAndSlaves")
+	defer log.Trace("<<<<< retryCleanupDeviceAndSlaves")
 
 	// check if mpathName exists for the device, else populate it
 	if dev.MpathName == "" {
-		err = setAltFullPathName(dev)
+		err := setAltFullPathName(dev)
 		if err != nil {
 			return err
 		}
@@ -197,7 +215,8 @@ func retryCleanupDeviceAndSlaves(dev *model.Device) error {
 // cleanupDeviceAndSlaves : remove the multipath devices and its slaves and logout iscsi targets
 // nolint: gocyclo
 func cleanupDeviceAndSlaves(dev *model.Device) (err error) {
-	log.Tracef("cleanupDeviceAndSlaves called for %+v", dev)
+	log.Tracef(">>>>> cleanupDeviceAndSlaves called for %+v", dev)
+	defer log.Trace("<<<<< cleanupDeviceAndSlaves")
 
 	isFC := isFibreChannelDevice(dev.Slaves)
 
@@ -209,7 +228,7 @@ func cleanupDeviceAndSlaves(dev *model.Device) (err error) {
 	// remove dm device
 	removeErr := multipathRemoveDmDevice(dev)
 	if removeErr != nil {
-		log.Error(err)
+		log.Error(removeErr.Error())
 		// proceed with the rest of the path cleanup nevertheless, as mpath might get deleted asynchronously
 	}
 
@@ -224,6 +243,7 @@ func cleanupDeviceAndSlaves(dev *model.Device) (err error) {
 		log.Debugf("volume scoped target %+v, initiating iscsi logout and delete", dev.IscsiTarget)
 		err = logoutAndDeleteIscsiTarget(dev)
 		if err != nil {
+			log.Error(err.Error())
 			return err
 		}
 	} else {
@@ -248,7 +268,9 @@ func cleanupDeviceAndSlaves(dev *model.Device) (err error) {
 }
 
 func deleteSdDevices(paths []*model.PathInfo) error {
-	log.Tracef("deleteSdDevices called")
+	log.Tracef(">>>>> deleteSdDevices")
+	defer log.Trace("<<<<< deleteSdDevices")
+
 	for _, path := range paths {
 		err := deleteSdDevice(path.Device)
 		if err != nil {
@@ -261,16 +283,18 @@ func deleteSdDevices(paths []*model.PathInfo) error {
 }
 
 func logoutAndDeleteIscsiTarget(dev *model.Device) error {
-	log.Tracef("logoutAndDeleteIscsiTarget called for device %s", dev.AltFullPathName)
+	log.Tracef(">>>>> logoutAndDeleteIscsiTarget for device %s", dev.AltFullPathName)
+	defer log.Tracef("<<<<< logoutAndDeleteIscsiTarget")
+
 	if dev.IscsiTarget != nil {
 		log.Tracef("initiating the iscsi target logout for %s of type %s", dev.IscsiTarget.Name, dev.IscsiTarget.Scope)
 		//logout of iscsi target
-		err := iscsilogoutOfTarget(dev.IscsiTarget)
+		err := iscsiLogoutOfTarget(dev.IscsiTarget)
 		if err != nil {
 			return fmt.Errorf("unable to logout iscsi target %s. Error: %s", dev.IscsiTarget, err.Error())
 		}
 		//delete iscsi node
-		err = iscsideleteNode(dev.IscsiTarget)
+		err = iscsiDeleteNode(dev.IscsiTarget)
 		if err != nil {
 			return fmt.Errorf("unable to delete iscsi target: %s. Error: %s", dev.IscsiTarget, err.Error())
 		}
@@ -280,7 +304,12 @@ func logoutAndDeleteIscsiTarget(dev *model.Device) error {
 
 // multipathDisableQueuing : disable queueing on the multipath device
 func multipathDisableQueuing(dev *model.Device) (err error) {
-	log.Tracef("multipathDisableQueuing")
+	log.Trace(">>>>> multipathDisableQueuing for", dev.MpathName)
+	defer log.Trace("<<<<< multipathDisableQueuing")
+
+	multipathMutex.Lock()
+	defer multipathMutex.Unlock()
+
 	args := []string{"message", dev.MpathName, "0", "fail_if_no_path"}
 	out, _, err := util.ExecCommandOutput(dmsetupcommand, args)
 	if err != nil {
@@ -294,18 +323,12 @@ func multipathDisableQueuing(dev *model.Device) (err error) {
 
 // multipathRemoveDmDevice : remove multipath device ps via dmsetup
 func multipathRemoveDmDevice(dev *model.Device) (err error) {
-	log.Tracef("multipathRemoveDmDevice called for %+v", dev)
-	err = multipathRemoveMapDmSetup(dev)
-	if err != nil {
-		return fmt.Errorf("failed to remove multipath device %s. Error: %s ", dev.MpathName, err.Error())
-	}
-	log.Debugf("successfully removed the dm device %s", dev.MpathName)
-	return nil
-}
+	log.Tracef(">>>>> multipathRemoveDmDevice called for %+v", dev)
+	defer log.Trace("<<<<< multipathRemoveDmDevice")
 
-// multipathRemoveMapDmSetup : remove multipath maps via dmsetup
-func multipathRemoveMapDmSetup(dev *model.Device) (err error) {
-	log.Tracef("multipathRemoveMapDmSetup called for %+v", dev)
+	multipathMutex.Lock()
+	defer multipathMutex.Unlock()
+
 	if dev.MpathName == "" {
 		err = setAltFullPathName(dev)
 		if err != nil {
@@ -317,15 +340,20 @@ func multipathRemoveMapDmSetup(dev *model.Device) (err error) {
 	if err != nil {
 		return fmt.Errorf("failed to remove multipath map for %s. Error: %s", dev.MpathName, err.Error())
 	}
-	if out != "" && strings.Contains(out, deviceDoesNotExist) == false {
+	if out != "" && !strings.Contains(out, "ok") && !strings.Contains(out, deviceDoesNotExist) {
 		return fmt.Errorf("failed to remove device map for %s. Error: %s", dev.MpathName, out)
 	}
+
+	log.Debugf("successfully removed the dm device %s", dev.MpathName)
 	return nil
 }
 
 func cleanupErrorMultipathMaps() (err error) {
 	log.Traceln(">>> cleanupErrorMultipathMaps")
 	defer log.Traceln("<<< cleanupErrorMultipathMaps")
+
+	multipathMutex.Lock()
+	defer multipathMutex.Unlock()
 
 	// run dmsetup table ls and fetch error maps
 	args := []string{"table"}
@@ -430,7 +458,7 @@ func multipathGetPathsOfDevice(dev *model.Device, needActivePath bool) (paths []
 			if !needActivePath {
 				log.Tracef("needActive %v dev(%s) dm_st(%s) hcil(%s) for uuid(%s)", needActivePath, entry[1], entry[2], entry[3], entry[0])
 				path := &model.PathInfo{
-					UUID:     entry[0],
+					UUID:     entry[0][1:],
 					Device:   entry[1],
 					DmState:  entry[2],
 					Hcil:     entry[3],
@@ -441,7 +469,7 @@ func multipathGetPathsOfDevice(dev *model.Device, needActivePath bool) (paths []
 			} else if len(entry) >= 5 && entry[2] == model.ActiveState.String() && entry[5] == "ready" {
 				log.Tracef("needActive %v dev(%s) chk_st(%s) dm_st(%s) for uuid(%s)", needActivePath, entry[1], entry[5], entry[2], entry[0])
 				path := &model.PathInfo{
-					UUID:     entry[0],
+					UUID:     entry[0][1:],
 					Device:   entry[1],
 					DmState:  entry[2],
 					Hcil:     entry[3],

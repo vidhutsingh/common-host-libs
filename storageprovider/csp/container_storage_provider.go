@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
+	"github.com/hpe-storage/common-host-libs/concurrent"
 	"github.com/hpe-storage/common-host-libs/connectivity"
 	"github.com/hpe-storage/common-host-libs/jsonutil"
 	log "github.com/hpe-storage/common-host-libs/logger"
@@ -31,10 +32,9 @@ const (
 	descriptionKey = "description"
 )
 
-// DataWrapper is used to represent a generic JSON API payload
-type DataWrapper struct {
-	Data interface{} `json:"data"`
-}
+var (
+	loginMutex = concurrent.NewMapMutex()
+)
 
 // ErrorsPayload is a serializer struct for representing a valid JSON API errors payload.
 type ErrorsPayload struct {
@@ -68,7 +68,7 @@ func NewContainerStorageProvider(credentials *storageprovider.Credentials) (*Con
 	// Initialize the container provider client here so we don't have to do it in every method
 	client, err := getCspClient(credentials)
 	if err != nil {
-		log.Trace("Failed to initialize CSP client")
+		log.Errorf("Failed to initialize CSP client, Error: %s", err.Error())
 		return nil, err
 	}
 
@@ -79,13 +79,12 @@ func NewContainerStorageProvider(credentials *storageprovider.Credentials) (*Con
 
 	log.Trace("Attempting initial login to CSP")
 	status, err := csp.login()
-
 	if status != http.StatusOK {
 		log.Errorf("Failed to login to CSP.  Status code: %d.  Error: %s", status, err.Error())
 		return nil, err
 	}
 	if err != nil {
-		log.Tracef("Failed to login to CSP.  Error: %s", err.Error())
+		log.Errorf("Failed to login to CSP.  Error: %s", err.Error())
 		return nil, err
 	}
 
@@ -94,9 +93,7 @@ func NewContainerStorageProvider(credentials *storageprovider.Credentials) (*Con
 
 // login performs initial login to the CSP as well as periodic login if a session has expired
 func (provider *ContainerStorageProvider) login() (int, error) {
-	dataWrapper := &DataWrapper{
-		Data: &model.Token{},
-	}
+	response := &model.Token{}
 	var errorResponse *ErrorsPayload
 
 	// Storage-Provider
@@ -107,45 +104,72 @@ func (provider *ContainerStorageProvider) login() (int, error) {
 
 	// If serviceName is not specified (i.e, Off-Array), then pass the array IP address as well.
 	if provider.Credentials.ServiceName != "" {
+		log.Infof("About to attempt login to CSP for backend %s", provider.Credentials.Backend)
 		token.ArrayIP = provider.Credentials.Backend
 	}
+
+	loginMutex.Lock(provider.Credentials.Backend)
+	defer loginMutex.Unlock(provider.Credentials.Backend)
 
 	status, err := provider.Client.DoJSON(
 		&connectivity.Request{
 			Action:        "POST",
 			Path:          "/containers/v1/tokens",
-			Payload:       &DataWrapper{Data: token},
-			Response:      &dataWrapper,
+			Payload:       token,
+			Response:      &response,
 			ResponseError: &errorResponse,
 		},
 	)
 	if errorResponse != nil {
 		return status, handleError(status, errorResponse)
 	}
-	provider.AuthToken = dataWrapper.Data.(*model.Token).SessionToken
+	provider.AuthToken = response.SessionToken
 
 	return status, err
 }
 
 // invoke is used to invoke all methods against the CSP. Error handling should be added here.
 // Currently, it will login again if the server responds with a status code of unauthorized.
-func (provider *ContainerStorageProvider) invoke(request *connectivity.Request) (int, error) {
+func (provider *ContainerStorageProvider) invoke(request *connectivity.Request) (status int, err error) {
 	request.Header = make(map[string]string)
+	// Perform login attempt when AuthToken is empty
+	if provider.AuthToken == "" {
+		log.Info("Cached auth-token is empty, attempting login to CSP")
+		status, err = provider.login()
+		if status != http.StatusOK {
+			log.Errorf("Failed login attempt. Status %d. Error: %s", status, err.Error())
+			return status, err
+		}
+		if err != nil {
+			log.Errorf("Error while attempting login to CSP. Error: %s", err.Error())
+			return http.StatusInternalServerError, err
+		}
+		log.Info("Successfully re-generated new login auth-token")
+	}
+
 	request.Header[tokenHeader] = provider.AuthToken
 	if provider.Credentials.ServiceName != "" {
+		log.Tracef("About to invoke CSP request for backend %s", provider.Credentials.Backend)
 		request.Header[arrayIPHeader] = provider.Credentials.Backend
 	}
 
 	// Temporary copy of the Path as it gets modified/changed in the DoJSON() method.
 	// This is required to re-attempt with the original request once login is successful.
 	reqPath := request.Path
-	status, err := provider.Client.DoJSON(request)
+	status, err = provider.Client.DoJSON(request)
+	if status == http.StatusOK {
+		return status, nil
+	}
 	if status == http.StatusUnauthorized {
 		log.Info("Received unauthorization error. Attempting login...")
 		status, err = provider.login()
 		if status != http.StatusOK {
 			log.Errorf("Failed login during re-attempt. Status %d. Error: %s", status, err.Error())
 			return status, err
+		}
+		if err != nil {
+			log.Errorf("Error while login to CSP during re-attempt. Error: %s", err.Error())
+			return http.StatusInternalServerError, err
 		}
 		request.Path = reqPath      // Set the original path value
 		request.ResponseError = nil // Reset the previous error response
@@ -165,7 +189,7 @@ func (provider *ContainerStorageProvider) SetNodeContext(node *model.Node) error
 		&connectivity.Request{
 			Action:        "POST",
 			Path:          "/containers/v1/hosts",
-			Payload:       &DataWrapper{Data: node},
+			Payload:       &node,
 			Response:      nil,
 			ResponseError: &errorResponse,
 		},
@@ -212,9 +236,7 @@ func (provider *ContainerStorageProvider) CreateVolume(name, description string,
 	log.Tracef(">>>>> CreateVolume, name: %v, size: %v, opts: %v", name, size, opts)
 	defer log.Trace("<<<<< CreateVolume")
 
-	dataWrapper := &DataWrapper{
-		Data: &model.Volume{},
-	}
+	response := &model.Volume{}
 	var errorResponse *ErrorsPayload
 
 	volume := &model.Volume{
@@ -229,8 +251,8 @@ func (provider *ContainerStorageProvider) CreateVolume(name, description string,
 		&connectivity.Request{
 			Action:        "POST",
 			Path:          "/containers/v1/volumes",
-			Payload:       &DataWrapper{Data: volume},
-			Response:      &dataWrapper,
+			Payload:       &volume,
+			Response:      &response,
 			ResponseError: &errorResponse,
 		},
 	)
@@ -238,7 +260,65 @@ func (provider *ContainerStorageProvider) CreateVolume(name, description string,
 		return nil, handleError(status, errorResponse)
 	}
 
-	return dataWrapper.Data.(*model.Volume), err
+	return response, err
+}
+
+// CreateVolumeGroup creates a volume group on the CSP
+func (provider *ContainerStorageProvider) CreateVolumeGroup(name, description string, opts map[string]interface{}) (*model.VolumeGroup, error) {
+	log.Tracef(">>>>> CreateVolumeGroup, name: %s, opts: %+v", name, opts)
+	defer log.Trace("<<<<< CreateVolumeGroup")
+
+	response := &model.VolumeGroup{}
+	var errorResponse *ErrorsPayload
+
+	volume_group := &model.VolumeGroup{
+		Name:        name,
+		Description: description,
+		Config:      opts,
+	}
+
+	// Create the volume group on the array
+	status, err := provider.invoke(
+		&connectivity.Request{
+			Action:        "POST",
+			Path:          "/containers/v1/volume_groups",
+			Payload:       &volume_group,
+			Response:      &response,
+			ResponseError: &errorResponse,
+		},
+	)
+	if errorResponse != nil {
+		return nil, handleError(status, errorResponse)
+	}
+
+	return response, err
+}
+
+// DeleteVolumeGroup deletes a volume group on the CSP
+func (provider *ContainerStorageProvider) DeleteVolumeGroup(id string) error {
+	log.Tracef(">>>>> DeleteVolumeGroup, id: %s", id)
+	defer log.Trace("<<<<< DeleteVolumeGroup")
+
+	var errorResponse *ErrorsPayload
+
+	// Delete the volume group on the array
+	status, err := provider.invoke(
+		&connectivity.Request{
+			Action:        "DELETE",
+			Path:          fmt.Sprintf("/containers/v1/volume_groups/%s", id),
+			Payload:       nil,
+			Response:      nil,
+			ResponseError: &errorResponse,
+		},
+	)
+	if errorResponse != nil {
+		return handleError(status, errorResponse)
+	}
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // CloneVolume clones a volume on the CSP
@@ -313,9 +393,7 @@ func (provider *ContainerStorageProvider) CloneVolume(name, description, sourceI
 	}
 	log.Tracef("Clone requested with volume config: %+v", volume)
 
-	dataWrapper := &DataWrapper{
-		Data: &model.Volume{},
-	}
+	response := &model.Volume{}
 	var errorResponse *ErrorsPayload
 
 	// Clone the volume on the array
@@ -323,8 +401,8 @@ func (provider *ContainerStorageProvider) CloneVolume(name, description, sourceI
 		&connectivity.Request{
 			Action:        "POST",
 			Path:          "/containers/v1/volumes",
-			Payload:       &DataWrapper{Data: volume},
-			Response:      &dataWrapper,
+			Payload:       &volume,
+			Response:      &response,
 			ResponseError: &errorResponse,
 		},
 	)
@@ -338,7 +416,7 @@ func (provider *ContainerStorageProvider) CloneVolume(name, description, sourceI
 		return nil, handleError(status, errorResponse)
 	}
 
-	return dataWrapper.Data.(*model.Volume), err
+	return response, err
 }
 
 // DeleteVolume will remove a volume from the CSP
@@ -368,10 +446,7 @@ func (provider *ContainerStorageProvider) DeleteVolume(id string, force bool) er
 
 // PublishVolume will make a volume visible (add an ACL) to the given host
 func (provider *ContainerStorageProvider) PublishVolume(id, hostUUID, accessProtocol string) (*model.PublishInfo, error) {
-	dataResponse := &DataWrapper{
-		Data: &model.PublishInfo{},
-	}
-
+	response := &model.PublishInfo{}
 	var errorResponse *ErrorsPayload
 
 	publishOptions := &model.PublishOptions{
@@ -383,8 +458,8 @@ func (provider *ContainerStorageProvider) PublishVolume(id, hostUUID, accessProt
 		&connectivity.Request{
 			Action:        "PUT",
 			Path:          fmt.Sprintf("/containers/v1/volumes/%s/actions/publish", id),
-			Payload:       &DataWrapper{Data: publishOptions},
-			Response:      &dataResponse,
+			Payload:       &publishOptions,
+			Response:      &response,
 			ResponseError: &errorResponse,
 		},
 	)
@@ -392,7 +467,7 @@ func (provider *ContainerStorageProvider) PublishVolume(id, hostUUID, accessProt
 		return nil, handleError(status, errorResponse)
 	}
 
-	return dataResponse.Data.(*model.PublishInfo), err
+	return response, err
 }
 
 // UnpublishVolume will make a volume invisible (remove an ACL) from the given host
@@ -403,7 +478,7 @@ func (provider *ContainerStorageProvider) UnpublishVolume(id, hostUUID string) e
 		&connectivity.Request{
 			Action:        "PUT",
 			Path:          fmt.Sprintf("/containers/v1/volumes/%s/actions/unpublish", id),
-			Payload:       &DataWrapper{Data: &model.PublishOptions{HostUUID: hostUUID}},
+			Payload:       &model.PublishOptions{HostUUID: hostUUID},
 			Response:      nil,
 			ResponseError: &errorResponse,
 		},
@@ -420,9 +495,7 @@ func (provider *ContainerStorageProvider) ExpandVolume(id string, requestBytes i
 	log.Tracef(">>>>> ExpandVolume, id: %s, requestBytes: %d", id, requestBytes)
 	defer log.Traceln("<<<<< ExpandVolume")
 
-	dataWrapper := &DataWrapper{
-		Data: &model.Volume{},
-	}
+	response := &model.Volume{}
 	var errorResponse *ErrorsPayload
 
 	volume := &model.Volume{
@@ -435,8 +508,8 @@ func (provider *ContainerStorageProvider) ExpandVolume(id string, requestBytes i
 		&connectivity.Request{
 			Action:        "PUT",
 			Path:          fmt.Sprintf("/containers/v1/volumes/%s", id),
-			Payload:       &DataWrapper{Data: volume},
-			Response:      &dataWrapper,
+			Payload:       &volume,
+			Response:      &response,
 			ResponseError: &errorResponse,
 		},
 	)
@@ -444,25 +517,65 @@ func (provider *ContainerStorageProvider) ExpandVolume(id string, requestBytes i
 		return nil, handleError(status, errorResponse)
 	}
 
-	return dataWrapper.Data.(*model.Volume), err
+	return response, err
+}
+
+// EditVolume edits a volume on the CSP
+func (provider *ContainerStorageProvider) EditVolume(id string, opts map[string]interface{}) (*model.Volume, error) {
+	log.Tracef(">>>>> EditVolume, id: %s, opts: %v", id, opts)
+	defer log.Trace("<<<<< EditVolume")
+
+	response := &model.Volume{}
+	var errorResponse *ErrorsPayload
+
+	volume := &model.Volume{
+		ID: id,
+	}
+
+	// volumeGroupId is part of volume object and should be removed from opts
+	if val, ok := opts["volumeGroupId"]; ok {
+		delete(opts, "volumeGroupId")
+		volume.VolumeGroupId = val.(string)
+	}
+	volume.Config = opts
+
+	// Edit the volume on the array
+	status, err := provider.invoke(
+		&connectivity.Request{
+			Action:        "PUT",
+			Path:          fmt.Sprintf("/containers/v1/volumes/%s", id),
+			Payload:       &volume,
+			Response:      &response,
+			ResponseError: &errorResponse,
+		},
+	)
+	if errorResponse != nil {
+		return nil, handleError(status, errorResponse)
+	}
+
+	return response, err
 }
 
 // GetVolume will return information about the given volume
 func (provider *ContainerStorageProvider) GetVolume(id string) (*model.Volume, error) {
-	dataWrapper := &DataWrapper{
-		Data: &model.Volume{},
-	}
+	response := &model.Volume{}
 	var errorResponse *ErrorsPayload
-
-	status, err := provider.invoke(
+	var status int
+	var err error
+	status, err = provider.invoke(
 		&connectivity.Request{
 			Action:        "GET",
 			Path:          fmt.Sprintf("/containers/v1/volumes/%s", id),
 			Payload:       nil,
-			Response:      &dataWrapper,
+			Response:      &response,
 			ResponseError: &errorResponse,
 		},
 	)
+
+	if status == http.StatusOK {
+		return response, nil
+	}
+
 	if status == http.StatusNotFound {
 		return nil, nil
 	}
@@ -471,14 +584,12 @@ func (provider *ContainerStorageProvider) GetVolume(id string) (*model.Volume, e
 		return nil, handleError(status, errorResponse)
 	}
 
-	return dataWrapper.Data.(*model.Volume), err
+	return nil, err
 }
 
 // GetVolumeByName will return information about the given volume
 func (provider *ContainerStorageProvider) GetVolumeByName(name string) (*model.Volume, error) {
-	dataWrapper := &DataWrapper{
-		Data: make([]*model.Volume, 0),
-	}
+	response := make([]*model.Volume, 0)
 	var errorResponse *ErrorsPayload
 
 	status, err := provider.invoke(
@@ -486,7 +597,7 @@ func (provider *ContainerStorageProvider) GetVolumeByName(name string) (*model.V
 			Action:        "GET",
 			Path:          fmt.Sprintf("/containers/v1/volumes?name=%s", name),
 			Payload:       nil,
-			Response:      &dataWrapper,
+			Response:      &response,
 			ResponseError: &errorResponse,
 		},
 	)
@@ -499,7 +610,7 @@ func (provider *ContainerStorageProvider) GetVolumeByName(name string) (*model.V
 	}
 
 	// there should only be one volume
-	values := reflect.ValueOf(dataWrapper.Data)
+	values := reflect.ValueOf(response)
 	if values.Len() == 0 {
 		log.Errorf("Could not find volume %s in json response", name)
 		return nil, fmt.Errorf("Could not find volume named %s in json response", name)
@@ -517,9 +628,7 @@ func (provider *ContainerStorageProvider) GetVolumeByName(name string) (*model.V
 
 // GetVolumes returns all of the volumes from the CSP
 func (provider *ContainerStorageProvider) GetVolumes() ([]*model.Volume, error) {
-	dataWrapper := &DataWrapper{
-		Data: make([]*model.Volume, 0),
-	}
+	response := make([]*model.Volume, 0)
 	var errorResponse *ErrorsPayload
 
 	status, err := provider.invoke(
@@ -527,7 +636,7 @@ func (provider *ContainerStorageProvider) GetVolumes() ([]*model.Volume, error) 
 			Action:        "GET",
 			Path:          "/containers/v1/volumes",
 			Payload:       nil,
-			Response:      &dataWrapper,
+			Response:      &response,
 			ResponseError: &errorResponse,
 		},
 	)
@@ -536,7 +645,7 @@ func (provider *ContainerStorageProvider) GetVolumes() ([]*model.Volume, error) 
 	}
 
 	// unmarshal each volume... TODO: do this via reflection for all object types
-	values := reflect.ValueOf(dataWrapper.Data)
+	values := reflect.ValueOf(response)
 	log.Tracef("Found %d volumes", values.Len())
 	volumes := make([]*model.Volume, values.Len())
 	for i := 0; i < values.Len(); i++ {
@@ -553,9 +662,7 @@ func (provider *ContainerStorageProvider) GetVolumes() ([]*model.Volume, error) 
 
 // GetSnapshots returns all of the snapshots for the given source volume from the CSP
 func (provider *ContainerStorageProvider) GetSnapshots(volumeID string) ([]*model.Snapshot, error) {
-	dataWrapper := &DataWrapper{
-		Data: make([]*model.Snapshot, 0),
-	}
+	response := make([]*model.Snapshot, 0)
 	var errorResponse *ErrorsPayload
 
 	var path string
@@ -570,7 +677,7 @@ func (provider *ContainerStorageProvider) GetSnapshots(volumeID string) ([]*mode
 			Action:        "GET",
 			Path:          path,
 			Payload:       nil,
-			Response:      &dataWrapper,
+			Response:      &response,
 			ResponseError: &errorResponse,
 		},
 	)
@@ -579,7 +686,7 @@ func (provider *ContainerStorageProvider) GetSnapshots(volumeID string) ([]*mode
 	}
 
 	// unmarshal each snapshot... TODO: do this via reflection for all object types
-	values := reflect.ValueOf(dataWrapper.Data)
+	values := reflect.ValueOf(response)
 	log.Tracef("Found %d snapshots", values.Len())
 	snapshots := make([]*model.Snapshot, values.Len())
 	for i := 0; i < values.Len(); i++ {
@@ -598,9 +705,7 @@ func (provider *ContainerStorageProvider) GetSnapshot(id string) (*model.Snapsho
 	log.Trace(">>>>> GetSnapshot, id:", id)
 	defer log.Trace("<<<<< GetSnapshot")
 
-	dataWrapper := &DataWrapper{
-		Data: &model.Snapshot{},
-	}
+	response := &model.Snapshot{}
 	var errorResponse *ErrorsPayload
 
 	status, err := provider.invoke(
@@ -608,7 +713,7 @@ func (provider *ContainerStorageProvider) GetSnapshot(id string) (*model.Snapsho
 			Action:        "GET",
 			Path:          fmt.Sprintf("/containers/v1/snapshots/%s", id),
 			Payload:       nil,
-			Response:      &dataWrapper,
+			Response:      &response,
 			ResponseError: &errorResponse,
 		},
 	)
@@ -620,16 +725,14 @@ func (provider *ContainerStorageProvider) GetSnapshot(id string) (*model.Snapsho
 		return nil, handleError(status, errorResponse)
 	}
 
-	return dataWrapper.Data.(*model.Snapshot), err
+	return response, err
 }
 
 // GetSnapshotByName will return information about the given snapshot
 func (provider *ContainerStorageProvider) GetSnapshotByName(name string, volumeID string) (*model.Snapshot, error) {
 
 	// Get all snapshots for the given snapshot name and source volume ID
-	dataWrapper := &DataWrapper{
-		Data: make([]*model.Snapshot, 0),
-	}
+	response := make([]*model.Snapshot, 0)
 	var errorResponse *ErrorsPayload
 
 	status, err := provider.invoke(
@@ -637,7 +740,7 @@ func (provider *ContainerStorageProvider) GetSnapshotByName(name string, volumeI
 			Action:        "GET",
 			Path:          fmt.Sprintf("/containers/v1/snapshots?name=%s&volume_id=%s", name, volumeID),
 			Payload:       nil,
-			Response:      &dataWrapper,
+			Response:      &response,
 			ResponseError: &errorResponse,
 		},
 	)
@@ -655,7 +758,7 @@ func (provider *ContainerStorageProvider) GetSnapshotByName(name string, volumeI
 	}
 
 	// There should only be one snapshot
-	values := reflect.ValueOf(dataWrapper.Data)
+	values := reflect.ValueOf(response)
 	if values.Len() == 0 {
 		log.Errorf("Could not find snapshot %s in json response", name)
 		return nil, fmt.Errorf("Could not find snapshot named %s in json response", name)
@@ -675,9 +778,7 @@ func (provider *ContainerStorageProvider) CreateSnapshot(name, description, sour
 	log.Tracef(">>>>> CreateSnapshot, name: %v, description: %v, sourceVolumeID: %v", name, description, sourceVolumeID)
 	defer log.Traceln("<<<<< CreateSnapshot")
 
-	dataWrapper := &DataWrapper{
-		Data: &model.Snapshot{},
-	}
+	response := &model.Snapshot{}
 	var errorResponse *ErrorsPayload
 
 	snapshot := &model.Snapshot{
@@ -692,8 +793,8 @@ func (provider *ContainerStorageProvider) CreateSnapshot(name, description, sour
 		&connectivity.Request{
 			Action:        "POST",
 			Path:          "/containers/v1/snapshots",
-			Payload:       &DataWrapper{Data: snapshot},
-			Response:      &dataWrapper,
+			Payload:       &snapshot,
+			Response:      &response,
 			ResponseError: &errorResponse,
 		},
 	)
@@ -709,7 +810,7 @@ func (provider *ContainerStorageProvider) CreateSnapshot(name, description, sour
 		return nil, err
 	}
 
-	return dataWrapper.Data.(*model.Snapshot), err
+	return response, err
 }
 
 // DeleteSnapshot will remove a snapshot from the CSP

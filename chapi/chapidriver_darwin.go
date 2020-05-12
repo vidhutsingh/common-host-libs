@@ -33,7 +33,7 @@ func (driver *MacDriver) GetMountOptions(device *model.Device, mountPoint string
 }
 
 // GetHostNetworks reports the networks on this host
-func (driver *MacDriver) GetHostNetworks() ([]*model.Network, error) {
+func (driver *MacDriver) GetHostNetworks() ([]*model.NetworkInterface, error) {
 	return nil, fmt.Errorf("not implemented")
 }
 
@@ -92,6 +92,11 @@ func (driver *MacDriver) BindMountDevice(mountPoint string, newMountPoint string
 	return fmt.Errorf("not implemented")
 }
 
+// GetDevice will return device matching given volume serial
+func (driver *MacDriver) GetDevice(volume *model.Volume) (*model.Device, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
 // CreateDevices will create devices on this host based on the volume details provided
 func (driver *MacDriver) CreateDevices(volumes []*model.Volume) ([]*model.Device, error) {
 	return nil, fmt.Errorf("not implemented")
@@ -117,7 +122,17 @@ func (driver *MacDriver) BindMount(mountPoint string, newMountPoint string, rbin
 	return fmt.Errorf("not implemented")
 }
 
+// BindUnmount unmounts the given bind mount
+func (driver *MacDriver) BindUnmount(mountPoint string) error {
+	return fmt.Errorf("not implemented")
+}
+
 // ExpandDevice will expand the given device/filesystem on the host
 func (driver *MacDriver) ExpandDevice(targetPath string, volAccessType model.VolumeAccessType) error {
 	return fmt.Errorf("not implemented")
+}
+
+// MountNFSVolume mounts NFS share onto given target path
+func (driver *MacDriver) MountNFSVolume(source string, targetPath string, mountOptions []string) error {
+	return nil
 }

@@ -22,26 +22,26 @@ import (
 )
 
 const (
-	dmsetupcommand      = "dmsetup"
-	majorMinorPattern   = "(.*)\\((?P<Major>\\d+),\\s+(?P<Minor>\\d+)\\)"
-	errorMapPattern     = "((?P<mapname>.*):.*error)"
-	dmPrefix            = "dm-"
-	serialNumberPattern = "2[a-f0-9]{16}6c9ce9[a-f0-9]{10}"
-	dmUUIDdFormat       = "/sys/block/dm-%s/dm/uuid"
-	dmNameFormat        = "/sys/block/dm-%s/dm/name"
-	dmSizeFormat        = "/sys/block/dm-%s/size"
-	devMapperPath       = "/dev/mapper/"
-	failedDevPath       = "failed to get device path"
-	deviceDoesNotExist  = "No such device or address"
-	noFileOrDirErr      = "No such file or directory"
-	offlinePathString   = "/sys/block/%s/device/state"
-	deletePathString    = "/sys/block/%s/device/delete"
-	sysBlockHolders     = "/sys/block/%s/holders/"
-	holderPattern       = "^.*dm-"
-	countdownTicker     = 30
-	sectorstoMiBFactor  = 2 * 1024
-	procScsiPath        = "/proc/scsi/scsi"
-	procScsiPathLocal   = "/proc_local/scsi/scsi"
+	dmsetupcommand     = "dmsetup"
+	majorMinorPattern  = "(.*)\\((?P<Major>\\d+),\\s+(?P<Minor>\\d+)\\)"
+	errorMapPattern    = "((?P<mapname>.*):.*error)"
+	dmPrefix           = "dm-"
+	dmUUIDdFormat      = "/sys/block/dm-%s/dm/uuid"
+	dmNameFormat       = "/sys/block/dm-%s/dm/name"
+	dmSizeFormat       = "/sys/block/dm-%s/size"
+	devMapperPath      = "/dev/mapper/"
+	failedDevPath      = "failed to get device path"
+	notBlockDevice     = "not a block device"
+	deviceDoesNotExist = "No such device or address"
+	noFileOrDirErr     = "No such file or directory"
+	offlinePathString  = "/sys/block/%s/device/state"
+	deletePathString   = "/sys/block/%s/device/delete"
+	sysBlockHolders    = "/sys/block/%s/holders/"
+	holderPattern      = "^.*dm-"
+	countdownTicker    = 5
+	sectorstoMiBFactor = 2 * 1024
+	procScsiPath       = "/proc/scsi/scsi"
+	procScsiPathLocal  = "/proc_local/scsi/scsi"
 	// HCTL format in /proc/scsi/scsi
 	// eg Host: scsi7 Channel: 00 Id: 00 Lun: 00
 	procScsiHctlPattern = "Host:\\s+scsi(?P<h>\\d+)\\s+Channel:\\s+(?P<c>\\d+)\\s+Id:\\s+(?P<t>\\d+)\\s+Lun:\\s+(?P<l>\\d+)"
@@ -51,10 +51,9 @@ const (
 )
 
 var (
-	deletingDevices     DeletingDevices
-	procScsiHctlRegex   = regexp.MustCompile(procScsiHctlPattern)
-	serialNumberMatcher = regexp.MustCompile(serialNumberPattern)
-	errorMapRegex       = regexp.MustCompile(errorMapPattern)
+	deletingDevices   DeletingDevices
+	procScsiHctlRegex = regexp.MustCompile(procScsiHctlPattern)
+	errorMapRegex     = regexp.MustCompile(errorMapPattern)
 )
 
 // DeletingDevices represents serial numbers of devices being deleted
@@ -158,6 +157,17 @@ func GetDmDeviceFromSerial(serial string) (*model.Device, error) {
 	device := &model.Device{SerialNumber: serial}
 	result := util.FindStringSubmatchMap(listOut[0], r)
 
+	// if user_friendly_names is disabled, then get the actual mpath serial(with scsi-id prefix)
+	if strings.Contains(mapname, serial) {
+		fileName := fmt.Sprintf(dmUUIDdFormat, result["minor"])
+		mpathSerialNumber, err := util.FileReadFirstLine(fileName)
+		if err != nil {
+			log.Warnf("unable to retrieve device info from %s, err %s", fileName, err.Error())
+			return nil, err
+		}
+		mapname = strings.TrimPrefix(mpathSerialNumber, "mpath-")
+	}
+
 	// path name in the format of /dev/dm-<minor>
 	path := "/dev/" + dmPrefix + string(result["minor"])
 	device.Pathname = path
@@ -168,11 +178,11 @@ func GetDmDeviceFromSerial(serial string) (*model.Device, error) {
 	return device, nil
 }
 
-// GetNimbleDmDevices : Gets the list of Linux Multipath Devices
+// GetLinuxDmDevices : Gets the list of Linux Multipath Devices
 // nolint : gocyclo
-func GetNimbleDmDevices(needActivePath bool, serialNumber, lunID string) (a []*model.Device, err error) {
-	log.Tracef(">>>>>> GetNimbleDmDevices called with %s and lunID %s", serialNumber, lunID)
-	defer log.Trace("<<<<<< GetNimbleDmDevices")
+func GetLinuxDmDevices(needActivePath bool, serialNumber, lunID string) (a []*model.Device, err error) {
+	log.Tracef(">>>>>> GetLinuxDmDevices called with %s and lunID %s", serialNumber, lunID)
+	defer log.Trace("<<<<<< GetLinuxDmDevices")
 	args := []string{"ls", "--target", "multipath"}
 	out, _, err := util.ExecCommandOutput(dmsetupcommand, args)
 	if err != nil {
@@ -217,26 +227,17 @@ func GetNimbleDmDevices(needActivePath bool, serialNumber, lunID string) (a []*m
 		}
 		// trim mpath- prefix from uuid read from /sys/block/dm-x/dm/uuid
 		mpathSerialNumber = strings.TrimPrefix(mpathSerialNumber, "mpath-")
+		// truncate scsi-id prefix added by multipathd(2 for EUI and 3 for NAA ID types)
+		mpathSerialNumber = mpathSerialNumber[1:]
 		if serialNumber != "" {
-			if !strings.Contains(mpathSerialNumber, serialNumber) {
+			if !strings.EqualFold(mpathSerialNumber, serialNumber) {
 				log.Tracef("serialNumber %s not match with mpathSerialNumber, %s continuing..", mpathSerialNumber, serialNumber)
 				continue
 			}
 		}
 
-		var serialNumberMatcher *regexp.Regexp
-		if serialNumber == "" {
-			serialNumberMatcher, err = regexp.Compile(serialNumberPattern)
-		} else {
-			serialNumberMatcher, err = regexp.Compile(serialNumber)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("unable to compile regexp with %s", serialNumber)
-		}
-		if serialNumberMatcher.MatchString(mpathSerialNumber) {
-			listSerial := serialNumberMatcher.FindString(mpathSerialNumber)
-			log.Debugf("SerialNumber Matched :%s", listSerial)
-			device.SerialNumber = listSerial
+		if serialNumber == "" || strings.EqualFold(mpathSerialNumber, serialNumber) {
+			device.SerialNumber = mpathSerialNumber
 
 			sizeInMiB, err := getSizeOfDeviceInMiB(result["Minor"], device)
 			if err != nil {
@@ -392,7 +393,7 @@ func rescanLoginVolume(volume *model.Volume) error {
 			}
 		}
 		// iSCSI volume
-		err = RescanAndLoginToTarget(volume)
+		err = HandleIscsiDiscovery(volume)
 		if err != nil {
 			return err
 		}
@@ -400,11 +401,11 @@ func rescanLoginVolume(volume *model.Volume) error {
 	return nil
 }
 
-// CreateNimbleDevice : attaches and creates a new nimble device
+// CreateLinuxDevice : attaches and creates a new linux device
 // nolint: gocyclo
-func createNimbleDevice(volume *model.Volume) (dev *model.Device, err error) {
-	log.Debugf(">>>> createNimbleDevice called with volume %s serialNumber %s and lunID %s", volume.Name, volume.SerialNumber, volume.LunID)
-	defer log.Debug("<<<<< createNimbleDevice")
+func createLinuxDevice(volume *model.Volume) (dev *model.Device, err error) {
+	log.Debugf(">>>> createLinuxDevice called with volume %s serialNumber %s and lunID %s", volume.Name, volume.SerialNumber, volume.LunID)
+	defer log.Debug("<<<<< createLinuxDevice")
 	// Rescan and detect the newly attached volume
 	err = rescanLoginVolume(volume)
 	if err != nil {
@@ -415,8 +416,8 @@ func createNimbleDevice(volume *model.Volume) (dev *model.Device, err error) {
 	// find multipath devices after the rescan and login
 	// Start a Countdown ticker
 	var devices []*model.Device
-	for i := 1; i <= countdownTicker; i++ {
-		devices, err = GetNimbleDmDevices(true, GetLinuxSerialNumber(volume.SerialNumber), volume.LunID)
+	for i := 0; i <= countdownTicker; i++ {
+		devices, err = GetLinuxDmDevices(true, volume.SerialNumber, volume.LunID)
 		if err != nil {
 			return nil, err
 		}
@@ -426,7 +427,7 @@ func createNimbleDevice(volume *model.Volume) (dev *model.Device, err error) {
 				continue
 			}
 			// Match SerialNumber
-			if d.SerialNumber == GetLinuxSerialNumber(volume.SerialNumber) {
+			if d.SerialNumber == volume.SerialNumber {
 				log.Debugf("Found device with matching SerialNumber:%s map %s and slaves %+v", d.SerialNumber, d.AltFullPathName, d.Slaves)
 				return d, nil
 			}
@@ -442,14 +443,14 @@ func createNimbleDevice(volume *model.Volume) (dev *model.Device, err error) {
 		handleOrphanPaths(volume)
 		// check any error maps are present and cleanup
 		cleanupErrorMultipathMaps()
-		log.Debugf("sleeping for 1 second waiting for device %s to appear after rescan", volume.SerialNumber)
-		time.Sleep(time.Second * 1)
+		log.Debugf("sleeping for 5 seconds waiting for device %s to appear after rescan", volume.SerialNumber)
+		time.Sleep(time.Second * 5)
 	}
 	// cleanup paths which maybe part of lsscsi but not in multipath as we haven't found the device yet
 	cleanupStaleScsiPaths(volume)
 	// try to logout the iscsi target if we could not find a device by now for VST Volume
-	if volume.TargetScope != GroupScope.String() && volume.Iqn != "" {
-		iscsilogoutOfTarget(&model.IscsiTarget{Name: volume.Iqn})
+	if volume.TargetScope != GroupScope.String() && len(volume.TargetNames()) != 0 {
+		iscsiLogoutOfTarget(&model.IscsiTarget{Name: volume.TargetNames()[0]})
 	}
 	// Reached here signifies the device was not found, throw an error
 	return nil, fmt.Errorf("device not found with serial %s or target %s", volume.SerialNumber, volume.Iqn)
@@ -610,7 +611,7 @@ func handleRemappedLun(volume *model.Volume) (err error) {
 			continue
 		}
 		// cleanup multipath device and all its paths, as we found its remapped with different LUN underneath
-		cleanupUnmappedDevice(GetLinuxSerialNumber(oldSerial), volume.LunID)
+		cleanupUnmappedDevice(oldSerial, volume.LunID)
 		// perform SCSI lun rescan to discover new volume paths
 		if strings.EqualFold(volume.AccessProtocol, "fc") {
 			RescanFcTarget(l)
@@ -638,7 +639,7 @@ func cleanupUnmappedDevice(oldSerial string, volumelunID string) error {
 	defer log.Traceln("<<< cleanupUnmappedDevice")
 	var devices []*model.Device
 	var err error
-	devices, err = GetNimbleDmDevices(false, oldSerial, "")
+	devices, err = GetLinuxDmDevices(false, oldSerial, "")
 	if err != nil {
 		log.Errorf("error occurred while getting unmapped device for serial %s, err %s", oldSerial, err.Error())
 		return err
@@ -695,7 +696,7 @@ func cleanupUnmappedDevice(oldSerial string, volumelunID string) error {
 							continue
 						}
 						// check for serial number from vpd page before deleting
-						if GetLinuxSerialNumber(currentSerial) == oldSerial {
+						if currentSerial == oldSerial {
 							deletePathByHctl(h, c, t, l)
 						}
 					}
@@ -863,16 +864,33 @@ func parseHctl(lunStr string) (h string, c string, t string, l string, err error
 	return h, c, t, l, nil
 }
 
-//CreateNimbleDevices : attached and creates nimble devices to host
-func CreateNimbleDevices(vols []*model.Volume) (devs []*model.Device, err error) {
-	log.Tracef("CreateNimbleDevices")
+// GetDeviceFromVolume returns Linux device for given volume info
+func GetDeviceFromVolume(vol *model.Volume) (*model.Device, error) {
+	log.Tracef(">>>>> GetDeviceFromVolume for serial %s", vol.SerialNumber)
+	defer log.Trace("<<<<< GetDeviceFromVolume")
+
+	devices, err := GetLinuxDmDevices(false, vol.SerialNumber, vol.LunID)
+	if err != nil {
+		return nil, err
+	}
+	if len(devices) == 0 {
+		return nil, fmt.Errorf("unable to find device matching volume serial number %s", vol.SerialNumber)
+	}
+	return devices[0], nil
+}
+
+//CreateLinuxDevices : attached and creates linux devices to host
+func CreateLinuxDevices(vols []*model.Volume) (devs []*model.Device, err error) {
+	log.Tracef(">>>>> CreateLinuxDevices")
+	defer log.Trace("<<<<< CreateLinuxDevices")
+
 	var devices []*model.Device
 	for _, vol := range vols {
 		log.Tracef("create request with serialnumber :%s, accessprotocol %s discoveryip %s, iqn %s ", vol.SerialNumber, vol.AccessProtocol, vol.DiscoveryIP, vol.Iqn)
-		if vol.AccessProtocol == iscsi && (vol.DiscoveryIP == "" || vol.Iqn == "") {
+		if vol.AccessProtocol == iscsi && (vol.DiscoveryIP == "" || vol.Iqn == "") && len(vol.DiscoveryIPs) == 0 {
 			return nil, fmt.Errorf("cannot discover without IP. Please sanity check host OS and array IP configuration, network, netmask and gateway")
 		}
-		device, err := createNimbleDevice(vol)
+		device, err := createLinuxDevice(vol)
 		if err != nil {
 			log.Errorf("unable to create device for volume %v with IQN %v", vol.Name, vol.Iqn)
 			// If we encounter an error, there may be some devices created and some not.
@@ -888,10 +906,6 @@ func CreateNimbleDevices(vols []*model.Volume) (devs []*model.Device, err error)
 // OfflineDevice : offline all the scsi paths for the multipath device
 func OfflineDevice(dev *model.Device) (err error) {
 	log.Tracef("OfflineDevice called with %s", dev.SerialNumber)
-	//validate nimble device
-	if serialNumberMatcher.MatchString(dev.SerialNumber) == false {
-		return fmt.Errorf("device %s is not a nimble device", dev.SerialNumber)
-	}
 	// perform offline scsi paths of the multipath device
 	if dev.SerialNumber == "" {
 		return fmt.Errorf("no serialNumber of device %v present, failing delete", dev)
@@ -941,14 +955,17 @@ func offlineScsiDevice(path string) (err error) {
 // DeleteDevice : delete the multipath device
 func DeleteDevice(dev *model.Device) (err error) {
 	log.Tracef("DeleteDevice called with %s", dev.SerialNumber)
-	//validate nimble device
-	if serialNumberMatcher.MatchString(dev.SerialNumber) == false {
-		return fmt.Errorf("device %s is not a nimble device", dev.SerialNumber)
-	}
 	// perform cleanup of the multipath device
 	if dev.SerialNumber == "" {
 		return fmt.Errorf("no serialNumber of device %v present, failing delete", dev)
 	}
+
+	//check if device is mounted or has holders
+	err = checkIfDeviceCanBeDeleted(dev)
+	if err != nil {
+		return err
+	}
+
 	err = deletingDevices.addDevice(dev.SerialNumber)
 	if err != nil {
 		// indicates device deletion is already in progress, don't error out
@@ -1020,9 +1037,14 @@ func getDeviceHolders(dev *model.Device) (h string, err error) {
 	var re = regexp.MustCompile(holderPattern)
 	log.Tracef("Path =  %s", dev.Pathname)
 	directoryPath := fmt.Sprintf(sysBlockHolders, dev.Pathname)
+	// holders folder might not exist in some flavors
+	dirExists, _, err := util.FileExists(directoryPath)
+	if !dirExists {
+		return "", nil
+	}
 	// walk all files in directory
 	err = filepath.Walk(directoryPath, func(path string, info os.FileInfo, err error) error {
-		if !info.IsDir() {
+		if info != nil && !info.IsDir() {
 			//check for valid symlink
 			var link string
 			link, err = os.Readlink(filepath.Join(directoryPath, info.Name()))
@@ -1043,15 +1065,10 @@ func getDeviceHolders(dev *model.Device) (h string, err error) {
 	return holder, nil
 }
 
-//GetLinuxSerialNumber :  Get the Linux Serial Number from the Array Sn
-func GetLinuxSerialNumber(arraySn string) string {
-	return "2" + arraySn
-}
-
 // RescanSize performs size rescan of all scsi devices on host and updates applicable multipath devices
 // TODO: replace rescan-scsi-bus.sh dependency with manual rescan of scsi devices
-func RescanForCapacityUpdates() error {
-	log.Tracef(">>>>> RescanForCapacityUpdates")
+func RescanForCapacityUpdates(devicePath string) error {
+	log.Tracef(">>>>> RescanForCapacityUpdates called for %s", devicePath)
 	defer log.Traceln("<<<<< RescanForCapacityUpdates")
 
 	args := []string{"-s", "-m"}
@@ -1060,25 +1077,32 @@ func RescanForCapacityUpdates() error {
 		return err
 	}
 
-	// reconfigure multipath maps to apply new size
-	args = []string{"reconfigure"}
-	_, _, err = util.ExecCommandOutput("multipathd", args)
-	if err != nil {
-		return err
+	if devicePath != "" {
+		// multipathd takes either mpathx(without prefix) or /dev/dm-x as input
+		devicePath = strings.TrimPrefix(devicePath, "/dev/mapper/")
+		// reload multipath map to apply new size
+		args = []string{"resize", "map", devicePath}
+		out, _, err := util.ExecCommandOutput("multipathd", args)
+		if err != nil {
+			return err
+		}
+		if !strings.Contains(out, "ok") {
+			return fmt.Errorf("failed to rescan device %s on resize, err: %s", devicePath, out)
+		}
 	}
-
 	return nil
 }
 
 // ExpandDevice expands device and filesystem at given targetPath to underlying volume size
+// targetPath is /dev/dm-* for block device and mountpoint for filesystem based device
 func ExpandDevice(targetPath string, volAccessType model.VolumeAccessType) error {
 	log.Tracef(">>>>> ExpandDevice called with targetPath: %s, volAccessType: %s", targetPath, volAccessType.String())
 	defer log.Traceln("<<<<< ExpandDevice")
 
 	// If Block volume access type
 	if volAccessType == model.BlockType {
-		// resize device
-		if err := RescanForCapacityUpdates(); err != nil {
+		// resize device with targetPath, i.e /dev/dm-*
+		if err := RescanForCapacityUpdates(targetPath); err != nil {
 			return fmt.Errorf("unable to perform rescan to update device capacity for %s, error :%s",
 				targetPath, err.Error())
 		}
@@ -1091,8 +1115,8 @@ func ExpandDevice(targetPath string, volAccessType model.VolumeAccessType) error
 	if err != nil || devPath == "" {
 		return fmt.Errorf("unable to get device mounted at %s", targetPath)
 	}
-	// resize device
-	err = RescanForCapacityUpdates()
+	// resize device with devPath, i.e /dev/mapper/mpath*
+	err = RescanForCapacityUpdates(devPath)
 	if err != nil {
 		return fmt.Errorf("unable to perform rescan to update device capacity for %s, error :%s", devPath, err.Error())
 	}
